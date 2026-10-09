@@ -39,11 +39,18 @@ def find_ffmpeg() -> Optional[str]:
     candidates = []
     if getattr(sys, "frozen", False):
         base = Path(sys.executable).parent
-        candidates += [base / "ffmpeg" / "ffmpeg.exe", base / "ffmpeg.exe"]
-        # PyInstaller one-file: extraction dir
+        candidates += [
+            base / "ffmpeg" / "ffmpeg.exe",
+            base / "ffmpeg.exe",
+            base / "_internal" / "ffmpeg" / "ffmpeg.exe",
+        ]
+        # PyInstaller extraction dir (_internal for onedir)
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
-            candidates.append(Path(meipass) / "ffmpeg.exe")
+            candidates += [
+                Path(meipass) / "ffmpeg" / "ffmpeg.exe",
+                Path(meipass) / "ffmpeg.exe",
+            ]
     else:
         base = Path(__file__).resolve().parent.parent
         candidates += [base / "ffmpeg" / "ffmpeg.exe", base / "ffmpeg.exe"]
@@ -72,21 +79,7 @@ def list_video_devices(ffmpeg: str) -> List[str]:
         log.error("device enumeration failed: %s", e)
         return []
     out = proc.stderr.decode("utf-8", errors="replace")
-    devices = []
-    in_video = False
-    for line in out.splitlines():
-        if "DirectShow video devices" in line:
-            in_video = True
-            continue
-        if "DirectShow audio devices" in line:
-            in_video = False
-            continue
-        m = re.search(r'"(.+)"\s*$', line.strip())
-        if in_video and m and "(video)" not in line:
-            name = m.group(1)
-            if not name.startswith("@device"):
-                devices.append(name)
-    return devices
+    return _parse_device_list(out, want="video")
 
 
 def list_audio_devices(ffmpeg: str) -> List[str]:
@@ -97,17 +90,41 @@ def list_audio_devices(ffmpeg: str) -> List[str]:
         log.error("audio device enumeration failed: %s", e)
         return []
     out = proc.stderr.decode("utf-8", errors="replace")
+    return _parse_device_list(out, want="audio")
+
+
+_DEVICE_LINE_RE = re.compile(r'"(.+)"\s*(?:\((?P<kind>\w+)\))?\s*$')
+
+
+def _parse_device_list(out: str, want: str) -> List[str]:
+    """Parse -list_devices output for ffmpeg >= 6 style output.
+
+    ffmpeg 9.x drops the "DirectShow video/audio devices" section headers
+    and tags each device inline as (video), (audio) or (none). Older
+    versions group devices under the section headers; support both.
+    """
     devices = []
-    in_audio = False
+    in_section = False
+    saw_tags = False
     for line in out.splitlines():
-        if "DirectShow audio devices" in line:
-            in_audio = True
+        if "DirectShow video devices" in line:
+            in_section = want == "video"
             continue
-        m = re.search(r'"(.+)"\s*$', line.strip())
-        if in_audio and m and "(audio)" not in line and "(video)" not in line:
-            name = m.group(1)
-            if not name.startswith("@device"):
+        if "DirectShow audio devices" in line:
+            in_section = want == "audio"
+            continue
+        m = _DEVICE_LINE_RE.search(line.strip())
+        if not m:
+            continue
+        name, kind = m.group(1), m.group("kind")
+        if name.startswith("@device"):
+            continue
+        if kind is not None:  # inline tag format (ffmpeg 9.x)
+            saw_tags = True
+            if kind == want:
                 devices.append(name)
+        elif in_section and not saw_tags:
+            devices.append(name)
     return devices
 
 
@@ -206,7 +223,11 @@ def build_record_command(
     prefer_hw: bool = True,
 ) -> List[str]:
     """Build the ffmpeg capture command writing to a fault-tolerant MKV."""
-    args = [ffmpeg, "-y", "-hide_banner", "-loglevel", "warning", "-stats_period", "5"]
+    args = [ffmpeg, "-y", "-hide_banner", "-loglevel", "warning", "-stats_period", "5",
+            # machine-readable progress on stdout (independent of -loglevel);
+            # used as a liveness signal when low-bitrate output makes the
+            # muxer flush the file only in rare bursts
+            "-progress", "pipe:1"]
     args += [
         "-f", "dshow",
         "-video_size", f"{mode.width}x{mode.height}",
@@ -246,6 +267,14 @@ HW_ENCODERS = [
 ]
 
 
+# Encoder option keys emitted by build_record_command / HW_ENCODERS, each
+# followed by one value token.
+_ENCODER_OPT_KEYS = {
+    "-preset", "-crf", "-tune", "-profile:v", "-global_quality",
+    "-cq", "-quality", "-rc", "-qp_i", "-qp_p", "-b:v", "-maxrate",
+}
+
+
 def with_encoder(args: List[str], encoder_args: List[str]) -> List[str]:
     """Replace the -c:v ... codec block in args with encoder_args."""
     out = list(args)
@@ -253,11 +282,10 @@ def with_encoder(args: List[str], encoder_args: List[str]) -> List[str]:
         i = out.index("-c:v")
     except ValueError:
         return out
-    # remove -c:v <name> plus common following option pairs we emitted
+    # remove -c:v <name> plus any following known encoder option pairs
     j = i + 2
-    while j < len(out) and out[j].startswith("-") is False:
-        j += 1
-    # remove known trailing encoder opts we added (preset/crf etc.)
+    while j + 1 < len(out) and out[j] in _ENCODER_OPT_KEYS:
+        j += 2
     del out[i:j]
     out[i:i] = encoder_args
     return out

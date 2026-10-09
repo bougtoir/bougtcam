@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bougtcam.ffmpeg_backend import (
     CaptureMode, choose_best_mode, fallback_modes, _MODE_RE,
-    build_record_command, with_encoder, HW_ENCODERS,
+    build_record_command, with_encoder, HW_ENCODERS, _parse_device_list,
 )
 from bougtcam.recorder import unique_output_path
 
@@ -60,6 +60,29 @@ def test_with_encoder_swaps_codec():
         Path("o.mkv"))
     new = with_encoder(args, HW_ENCODERS[0][1])
     assert "h264_nvenc" in new and "libx264" not in new
+
+
+def test_parse_devices_new_inline_tag_format():
+    out = (
+        '[in#0 @ 0] "screen-capture-recorder" (video)\n'
+        '[in#0 @ 0]   Alternative name "@device_sw_{X}\\{Y}"\n'
+        '[in#0 @ 0] "virtual-audio-capturer" (audio)\n'
+        '[in#0 @ 0]   Alternative name "@device_sw_{A}\\{B}"\n'
+    )
+    assert _parse_device_list(out, "video") == ["screen-capture-recorder"]
+    assert _parse_device_list(out, "audio") == ["virtual-audio-capturer"]
+
+
+def test_parse_devices_old_section_format():
+    out = (
+        'DirectShow video devices (some may be both video and audio devices)\n'
+        ' "My Cam"\n'
+        '  Alternative name "@device_pnp_\\\\?\\usb#x"\n'
+        'DirectShow audio devices\n'
+        ' "My Mic"\n'
+    )
+    assert _parse_device_list(out, "video") == ["My Cam"]
+    assert _parse_device_list(out, "audio") == ["My Mic"]
 
 
 def test_unique_output_path(tmp_path):

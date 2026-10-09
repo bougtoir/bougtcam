@@ -228,15 +228,48 @@ class BougtCamApp:
         return self.app.exec()
 
 
+def _pid_alive(pid: int) -> bool:
+    """True when a process with pid still exists (Windows)."""
+    if sys.platform != "win32":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    import ctypes
+    import ctypes.wintypes
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = ctypes.wintypes.HANDLE
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return False
+    try:
+        code = ctypes.wintypes.DWORD(0)
+        if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+            return False
+        return code.value == STILL_ACTIVE
+    finally:
+        k32.CloseHandle(h)
+
+
 def acquire_single_instance() -> bool:
-    """Prevent double launch via a lock file held for process lifetime."""
+    """Prevent double launch via a lock file recording the owner's pid."""
     lock = app_data_dir() / "bougtcam.lock"
     try:
         fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         os.write(fd, str(os.getpid()).encode())
         os.close(fd)
     except FileExistsError:
-        # stale lock? check pid on Windows is unreliable; try removing then retry once
+        # Lock exists: another live instance holds it unless its pid is gone.
+        try:
+            other_pid = int(lock.read_text().strip())
+        except (OSError, ValueError):
+            other_pid = -1
+        if other_pid > 0 and _pid_alive(other_pid):
+            return False
+        # stale lock: remove and retry once
         try:
             lock.unlink()
             fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)

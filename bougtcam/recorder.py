@@ -81,6 +81,9 @@ class Recorder:
         self._worker: Optional[threading.Thread] = None
         self._last_size = 0
         self._last_growth = 0.0
+        self._stderr_tail: List[str] = []
+        self._progress_time = 0.0
+        self._last_progress = 0.0
 
     # ---- public control ----
 
@@ -218,6 +221,7 @@ class Recorder:
                     self._proc = proc
                     self._mkv = mkv
                     self._last_size = 0
+                    self._last_progress = self._progress_time
                     self._last_growth = time.time()
                     self._emit(state="recording", camera=camera,
                                width=mode.width, height=mode.height, fps=mode.fps,
@@ -230,16 +234,46 @@ class Recorder:
 
     def _spawn(self, args: List[str]) -> Optional[subprocess.Popen]:
         try:
-            return subprocess.Popen(
+            proc = subprocess.Popen(
                 args,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 creationflags=CREATE_NO_WINDOW,
             )
         except OSError as e:
             log.error("failed to spawn ffmpeg: %s", e)
             return None
+        # Drain stderr continuously from spawn: ffmpeg blocks when the pipe
+        # buffer fills (verbose dshow warnings), stalling capture before the
+        # watchdog's reader would ever start.
+        tail = self._stderr_tail = []
+        self._progress_time = 0.0
+
+        def _drain() -> None:
+            try:
+                for raw in proc.stderr:
+                    tail.append(raw.decode("utf-8", errors="replace").rstrip())
+                    del tail[:-80]
+            except (OSError, ValueError):
+                pass
+
+        threading.Thread(target=_drain, name="ffmpeg-stderr", daemon=True).start()
+
+        def _drain_progress() -> None:
+            try:
+                for raw in proc.stdout:
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if line.startswith("out_time_ms="):
+                        try:
+                            self._progress_time = int(line.split("=", 1)[1]) / 1e6
+                        except ValueError:
+                            pass
+            except (OSError, ValueError):
+                pass
+
+        threading.Thread(target=_drain_progress, name="ffmpeg-stdout", daemon=True).start()
+        return proc
 
     def _confirm_capture(self, proc: Optional[subprocess.Popen], mkv: Path, grace: float = 6.0) -> bool:
         """A mode counts as working when ffmpeg stays alive and the file grows."""
@@ -248,18 +282,20 @@ class Recorder:
         deadline = time.time() + grace
         while time.time() < deadline:
             if proc.poll() is not None:
-                err = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
+                err = "\n".join(self._stderr_tail)
                 log.warning("ffmpeg exited rc=%s: %s", proc.returncode, err[-1500:])
                 try:
                     mkv.unlink()
                 except OSError:
                     pass
                 return False
+            if self._progress_time > 0:
+                return True
             if mkv.exists() and mkv.stat().st_size > 4096:
                 return True
             time.sleep(0.25)
-        # give it a last chance on file size
-        ok = mkv.exists() and mkv.stat().st_size > 4096
+        # give it a last chance on file size / mux progress
+        ok = self._progress_time > 0 or (mkv.exists() and mkv.stat().st_size > 4096)
         if not ok:
             self._kill(proc)
             try:
@@ -278,29 +314,25 @@ class Recorder:
 
     def _watchdog(self, proc: subprocess.Popen, mkv: Path) -> str:
         """Block while recording; returns 'stopped' | 'crashed' | 'stalled' | 'disk_full'."""
-        stderr_tail: List[str] = []
-        reader = threading.Thread(
-            target=lambda: stderr_tail.extend(
-                proc.stderr.read().decode("utf-8", errors="replace").splitlines()[-80:]
-            ) if proc.stderr else None,
-            daemon=True,
-        )
-        reader.start()
         while True:
             if not self._want_recording or self._stop_evt.is_set():
                 return "stopped"
             rc = proc.poll()
             if rc is not None:
-                if stderr_tail:
-                    log.warning("ffmpeg rc=%s tail: %s", rc, " | ".join(stderr_tail[-10:]))
+                if self._stderr_tail:
+                    log.warning("ffmpeg rc=%s tail: %s", rc, " | ".join(self._stderr_tail[-10:]))
                 return "crashed"
+            if self._progress_time > self._last_progress:
+                self._last_progress = self._progress_time
+                self._last_growth = time.time()
             if mkv.exists():
                 size = mkv.stat().st_size
                 if size > self._last_size:
                     self._last_size = size
                     self._last_growth = time.time()
                 elif time.time() - self._last_growth > 15:
-                    log.warning("output stalled at %d bytes", size)
+                    log.warning("output stalled at %d bytes (progress=%.1fs)",
+                                size, self._progress_time)
                     return "stalled"
             outdir = Path(self.config.output_dir)
             free = free_space_mb(outdir)
